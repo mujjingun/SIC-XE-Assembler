@@ -7,6 +7,7 @@
 #include <string.h>
 
 #define TEXT_RECORD_SIZE 0x1F
+#define MOD_RECORD_SIZE 1024
 
 struct parse_result {
     enum {
@@ -369,10 +370,21 @@ static int get_reg_num(const char* r)
     return -1;
 }
 
+struct modification_record {
+    int start_address;
+    int len; // in half bytes
+};
+
+struct mod_rec_array {
+    struct modification_record rec[MOD_RECORD_SIZE];
+    int len;
+};
+
 struct ins_context {
     int lineno;
     int base_addr;
     symtab symbols;
+    struct mod_rec_array* mod_rec;
     int pc;
     int opcode;
     char op_prefix;
@@ -452,7 +464,7 @@ static int assemble_ins(struct ins_context* ctx, unsigned char* output)
         // simple addressing
         int addr = symtab_find(ctx->symbols, m);
 
-        int is_absolute = is_extended;
+        int is_absolute = 0;
         if (addr == -1) {
             if (is_immediate) {
                 if (parse_int(m, &addr)) {
@@ -482,7 +494,7 @@ static int assemble_ins(struct ins_context* ctx, unsigned char* output)
 
         output[1] = 0x00;
 
-        if (is_absolute) {
+        if (is_absolute || is_extended) {
             rel = addr;
         } else {
             int pc_rel = addr - ctx->pc;
@@ -517,6 +529,18 @@ static int assemble_ins(struct ins_context* ctx, unsigned char* output)
             // disp
             output[2] = (addr >> 8) & 0xff;
             output[3] = addr & 0xff;
+
+            // add modification record
+            if (!is_absolute) {
+                if (ctx->mod_rec->len + 1 >= MOD_RECORD_SIZE) {
+                    printf("%d: Error: too many modification records\n", ctx->lineno);
+                    return -1;
+                }
+
+                struct modification_record* rec = &ctx->mod_rec->rec[ctx->mod_rec->len++];
+                rec->start_address = ctx->pc - 3;
+                rec->len = 5;
+            }
 
             return 4;
         } else {
@@ -557,6 +581,8 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
     int base_addr = -1;
 
     struct text_record rec = { 0, 0, "" };
+    struct mod_rec_array mod_rec;
+    mod_rec.len = 0;
 
     char line[4096];
     int first_real_line = 1;
@@ -588,7 +614,7 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
                 goto error;
             }
 
-            fprintf(obj, "H%6s%06X%06X\n", parse.p.label, starting_address, program_length);
+            fprintf(obj, "H%-6s%06X%06X\n", parse.p.label, starting_address, program_length);
 
             flush_text_record(obj, &rec, starting_address);
             continue;
@@ -613,6 +639,11 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
             continue;
         } else if (strcmp(parse.p.opcode, "END") == 0) {
             flush_text_record(obj, &rec, 0);
+
+            for (int i = 0; i < mod_rec.len; ++i) {
+                fprintf(obj, "M%06X%02X\n", mod_rec.rec[i].start_address, mod_rec.rec[i].len);
+            }
+
             fprintf(obj, "E%06X\n", starting_address);
 
             // TODO: find first executable line
@@ -686,6 +717,7 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
             ctx.lineno = lineno;
             ctx.base_addr = base_addr;
             ctx.symbols = symbols;
+            ctx.mod_rec = &mod_rec;
             ctx.pc = parse.pc;
             ctx.opcode = find_opcode(parse.p.opcode);
 

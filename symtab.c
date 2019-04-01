@@ -140,7 +140,7 @@ static int compare_symbol_infos(const void* a, const void* b)
     struct symbol_info* const* pa = a;
     struct symbol_info* const* pb = b;
 
-    return strcmp((*pa)->label, (*pb)->label);
+    return strcmp((*pb)->label, (*pa)->label);
 }
 
 void print_symtab_list_sorted(symtab tab)
