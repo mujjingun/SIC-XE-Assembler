@@ -18,6 +18,7 @@ struct parse_result {
     char label[10];
     char op_prefix;
     char opcode[10];
+    char operand_prefix;
     char operands[100];
 };
 
@@ -59,7 +60,15 @@ static struct parse_result parse_line(const char* line)
 
     // scan operand 0
     res.operands[0] = 0;
-    sscanf(line, " %99[^\n]", res.operands);
+    if (sscanf(line, " %99[^#@\n]", res.operands) == 1) {
+        res.operand_prefix = 0;
+    }
+    else if (sscanf(line, " #%99[^#@\n]", res.operands) == 1) {
+        res.operand_prefix = '#';
+    }
+    else if (sscanf(line, " @%99[^#@\n]", res.operands) == 1) {
+        res.operand_prefix = '@';
+    }
 
     res.result = PARSE_RESULT_VALID;
 
@@ -87,6 +96,14 @@ struct im_parse_result parse_im_line(const char* line)
 static int parse_int(const char* str, int* result)
 {
     if (sscanf(str, "%d", result) != 1) {
+        return -1;
+    }
+    return 0;
+}
+
+static int parse_hexint(const char* str, int* result)
+{
+    if (sscanf(str, "%x", result) != 1) {
         return -1;
     }
     return 0;
@@ -253,7 +270,7 @@ static int first_pass(const char* file, FILE* tmp, symtab symbols)
                 goto error;
             }
 
-            if (parse_int(parse.operands, &starting_address)) {
+            if (parse_hexint(parse.operands, &starting_address)) {
                 printf("%d: Error: cannot parse number\n", lineno);
                 goto error;
             }
@@ -305,13 +322,21 @@ static void write_listing(FILE* lst, int lineno, struct im_parse_result* parse, 
 {
     fprintf(lst, "%4d   ", lineno * 5);
     fprintf(lst, "%04X   ", parse->address);
-    fprintf(lst, "%-10s", parse->p.label);
     if (parse->p.op_prefix) {
+        fprintf(lst, "%-9s", parse->p.label);
         fprintf(lst, "%c", parse->p.op_prefix);
-        fprintf(lst, "%-9s", parse->p.opcode);
     } else {
+        fprintf(lst, "%-10s", parse->p.label);
+    }
+
+    if (parse->p.operand_prefix) {
+        fprintf(lst, "%-9s", parse->p.opcode);
+        fprintf(lst, "%c", parse->p.operand_prefix);
+    }
+    else {
         fprintf(lst, "%-10s", parse->p.opcode);
     }
+
     fprintf(lst, "%-20s", parse->p.operands);
 
     for (int i = 0; i < len; ++i) {
@@ -384,16 +409,18 @@ struct ins_context {
     int lineno;
     int base_addr;
     symtab symbols;
-    struct mod_rec_array* mod_rec;
     int pc;
     int opcode;
     char op_prefix;
     enum op_format fmt;
+    char operand_prefix;
     const char* operands;
 };
 
-static int assemble_ins(struct ins_context* ctx, unsigned char* output)
+static int assemble_ins(struct ins_context* ctx, unsigned char* output, struct modification_record* rec)
 {
+    rec->start_address = -1;
+
     if (ctx->fmt == FORMAT_1) {
         output[0] = ctx->opcode & 0xff;
 
@@ -442,15 +469,11 @@ static int assemble_ins(struct ins_context* ctx, unsigned char* output)
 
         output[0] = ctx->opcode & 0xfc;
 
-        if ((cnt = sscanf(ctx->operands, "%99[^#@, ] , %c", m, &ch)) >= 1) {
+        if ((cnt = sscanf(ctx->operands, "%99[^, ] , %c", m, &ch)) >= 1) {
             // simple addressing
-            is_simple = 1;
-        } else if ((cnt = sscanf(ctx->operands, "#%99[^#@, ] , %c", m, &ch)) >= 1) {
-            // immediate addressing
-            is_immediate = 1;
-        } else if ((cnt = sscanf(ctx->operands, "@%99[^#@, ] , %c", m, &ch)) >= 1) {
-            // indirect addressing
-            is_indirect = 1;
+            is_simple = ctx->operand_prefix == 0;
+            is_immediate = ctx->operand_prefix == '#';
+            is_indirect = ctx->operand_prefix == '@';
         } else if (sscanf(ctx->operands, " %c", &ch) != 1) {
             output[0] |= 0x03;
             output[1] = 0;
@@ -503,7 +526,7 @@ static int assemble_ins(struct ins_context* ctx, unsigned char* output)
             if (pc_rel >= -0x800 && pc_rel <= 0x7ff) {
                 rel = pc_rel;
                 output[1] |= 0x20;
-            } else if (base_rel >= 0 && base_rel <= 0xfff) {
+            } else if (ctx->base_addr >= 0 && base_rel >= 0 && base_rel <= 0xfff) {
                 rel = base_rel;
                 output[1] |= 0x40;
             } else {
@@ -532,12 +555,6 @@ static int assemble_ins(struct ins_context* ctx, unsigned char* output)
 
             // add modification record
             if (!is_absolute) {
-                if (ctx->mod_rec->len + 1 >= MOD_RECORD_SIZE) {
-                    printf("%d: Error: too many modification records\n", ctx->lineno);
-                    return -1;
-                }
-
-                struct modification_record* rec = &ctx->mod_rec->rec[ctx->mod_rec->len++];
                 rec->start_address = ctx->pc - 3;
                 rec->len = 5;
             }
@@ -586,6 +603,7 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
 
     char line[4096];
     int first_real_line = 1;
+    int first_executable_addr = -1;
     for (int lineno = 1; fgets(line, sizeof(line), tmp); lineno++) {
         if (!strchr(line, '\n')) {
             printf("%d: Error: line too long\n", lineno);
@@ -609,10 +627,7 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
 
             write_listing(lst, lineno, &parse, NULL, 0);
 
-            if (parse_int(parse.p.operands, &starting_address)) {
-                printf("%d: Error: cannot parse number\n", lineno);
-                goto error;
-            }
+            starting_address = parse.address;
 
             fprintf(obj, "H%-6s%06X%06X\n", parse.p.label, starting_address, program_length);
 
@@ -644,9 +659,12 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
                 fprintf(obj, "M%06X%02X\n", mod_rec.rec[i].start_address, mod_rec.rec[i].len);
             }
 
-            fprintf(obj, "E%06X\n", starting_address);
+            if (first_executable_addr == -1) {
+                printf("%d: Error: Cannot find executable code in assembly.\n", lineno);
+            }
 
-            // TODO: find first executable line
+            fprintf(obj, "E%06X\n", first_executable_addr);
+
             fprintf(lst, "%4d%20s%-10s%-20s\n", lineno * 5, "", parse.p.opcode, parse.p.operands);
 
             break;
@@ -717,7 +735,6 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
             ctx.lineno = lineno;
             ctx.base_addr = base_addr;
             ctx.symbols = symbols;
-            ctx.mod_rec = &mod_rec;
             ctx.pc = parse.pc;
             ctx.opcode = find_opcode(parse.p.opcode);
 
@@ -728,10 +745,22 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
 
             ctx.op_prefix = parse.p.op_prefix;
             ctx.fmt = find_op_format(parse.p.opcode);
+            ctx.operand_prefix = parse.p.operand_prefix;
             ctx.operands = parse.p.operands;
 
             unsigned char instruction[4];
-            int len = assemble_ins(&ctx, instruction);
+            struct modification_record mrec;
+            int len = assemble_ins(&ctx, instruction, &mrec);
+
+            // add modification record
+            if (mrec.start_address >= 0) {
+                if (mod_rec.len + 1 >= MOD_RECORD_SIZE) {
+                    printf("%d: Error: too many modification records\n", lineno);
+                    return -1;
+                }
+
+                mod_rec.rec[mod_rec.len++] = mrec;
+            }
 
             if (len == -1) {
                 goto error;
@@ -746,6 +775,10 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
             }
 
             write_listing(lst, lineno, &parse, instruction, len);
+
+            if (first_executable_addr == -1) {
+                first_executable_addr = parse.address;
+            }
         }
     }
 
@@ -771,9 +804,7 @@ void assemble(const char* cmd)
         return;
     }
 
-    if (symbols) {
-        symtab_free(symbols);
-    }
+    free_symbols();
     symbols = symtab_init();
 
     FILE* tmp = tmpfile();
