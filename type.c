@@ -17,8 +17,8 @@ void type(const char* cmd)
     }
 
     char line[4096];
-    for (int lineno = 0; fgets(line, sizeof(line), fp); ++lineno) {
-        printf("%d\t %s", lineno * 5 + 5, line);
+    while (fgets(line, sizeof(line), fp)) {
+        printf("%s", line);
     }
 
     fclose(fp);
