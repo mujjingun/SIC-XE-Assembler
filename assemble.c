@@ -9,6 +9,23 @@
 #define TEXT_RECORD_SIZE 0x1F
 #define MOD_RECORD_SIZE 1024
 
+enum directives {
+    DIRECTIVE_WORD = -2,
+    DIRECTIVE_RESW = -3,
+    DIRECTIVE_RESB = -4,
+    DIRECTIVE_BYTE = -5,
+    DIRECTIVE_START = -6,
+    DIRECTIVE_END = -7,
+    DIRECTIVE_BASE = -8,
+};
+
+struct operation {
+    char prefix;
+    int opcode;
+    enum op_format format;
+    char name[10];
+};
+
 struct parse_result {
     enum {
         PARSE_RESULT_COMMENT,
@@ -16,8 +33,7 @@ struct parse_result {
         PARSE_RESULT_ERROR = -1
     } result;
     char label[10];
-    char op_prefix;
-    char opcode[10];
+    struct operation op;
     char operand_prefix;
     char operands[100];
 };
@@ -27,8 +43,9 @@ static struct parse_result parse_line(const char* line)
     struct parse_result res;
     int n;
 
+    res.result = PARSE_RESULT_ERROR;
+
     if (line[0] == 0) {
-        res.result = PARSE_RESULT_ERROR;
         return res;
     }
     if (line[0] == '.') {
@@ -45,29 +62,54 @@ static struct parse_result parse_line(const char* line)
     }
 
     // scan opcode
-    res.op_prefix = 0;
+    res.op.prefix = 0;
 
     char prefix;
     if (sscanf(line, " %c%n", &prefix, &n) == 1) {
         if (prefix == '+') {
-            res.op_prefix = prefix;
+            res.op.prefix = prefix;
             line += n;
         }
     }
 
-    sscanf(line, "%9s%n", res.opcode, &n);
+    if (sscanf(line, "%9s%n", res.op.name, &n) != 1) {
+        return res;
+    }
+    res.op.opcode = find_opcode(res.op.name);
+    if (res.op.opcode == -1) {
+        if (strcmp(res.op.name, "WORD") == 0) {
+            res.op.opcode = DIRECTIVE_WORD;
+        } else if (strcmp(res.op.name, "RESW") == 0) {
+            res.op.opcode = DIRECTIVE_RESW;
+        } else if (strcmp(res.op.name, "RESB") == 0) {
+            res.op.opcode = DIRECTIVE_RESB;
+        } else if (strcmp(res.op.name, "BYTE") == 0) {
+            res.op.opcode = DIRECTIVE_BYTE;
+        } else if (strcmp(res.op.name, "START") == 0) {
+            res.op.opcode = DIRECTIVE_START;
+        } else if (strcmp(res.op.name, "BASE") == 0) {
+            res.op.opcode = DIRECTIVE_BASE;
+        } else if (strcmp(res.op.name, "END") == 0) {
+            res.op.opcode = DIRECTIVE_END;
+        } else {
+            return res;
+        }
+    } else {
+        res.op.format = find_op_format(res.op.name);
+    }
     line += n;
 
     // scan operand 0
     res.operands[0] = 0;
     if (sscanf(line, " %99[^#@\n]", res.operands) == 1) {
         res.operand_prefix = 0;
-    }
-    else if (sscanf(line, " #%99[^#@\n]", res.operands) == 1) {
+    } else if (sscanf(line, " #%99[^#@\n]", res.operands) == 1) {
         res.operand_prefix = '#';
-    }
-    else if (sscanf(line, " @%99[^#@\n]", res.operands) == 1) {
+    } else if (sscanf(line, " @%99[^#@\n]", res.operands) == 1) {
         res.operand_prefix = '@';
+    } else {
+        // no operands
+        res.operand_prefix = 0;
     }
 
     res.result = PARSE_RESULT_VALID;
@@ -81,7 +123,7 @@ struct im_parse_result {
     struct parse_result p;
 };
 
-struct im_parse_result parse_im_line(const char* line)
+static struct im_parse_result parse_im_line(const char* line)
 {
     struct im_parse_result res;
     int n;
@@ -174,7 +216,7 @@ static int parse_byte_string(const char* str, char* result, int max_size)
 
 static int calc_ins_length(int lineno, struct parse_result* parse)
 {
-    if (strcmp(parse->opcode, "WORD") == 0) {
+    if (parse->op.opcode == DIRECTIVE_WORD) {
         int word;
         if (parse_int(parse->operands, &word)) {
             printf("%d: Error: cannot parse number\n", lineno);
@@ -185,21 +227,21 @@ static int calc_ins_length(int lineno, struct parse_result* parse)
             return -1;
         }
         return 3;
-    } else if (strcmp(parse->opcode, "RESW") == 0) {
+    } else if (parse->op.opcode == DIRECTIVE_RESW) {
         int num_words;
         if (parse_int(parse->operands, &num_words)) {
             printf("%d: Error: cannot parse number\n", lineno);
             return -1;
         }
         return 3 * num_words;
-    } else if (strcmp(parse->opcode, "RESB") == 0) {
+    } else if (parse->op.opcode == DIRECTIVE_RESB) {
         int num_bytes;
         if (parse_int(parse->operands, &num_bytes)) {
             printf("%d: Error: cannot parse number\n", lineno);
             return -1;
         }
         return num_bytes;
-    } else if (strcmp(parse->opcode, "BYTE") == 0) {
+    } else if (parse->op.opcode == DIRECTIVE_BYTE) {
         char str[4096];
         int len = parse_byte_string(parse->operands, str, sizeof(str));
         if (len < 0) {
@@ -208,28 +250,28 @@ static int calc_ins_length(int lineno, struct parse_result* parse)
         }
         return len;
     } else {
-        int opcode = find_opcode(parse->opcode);
-        if (opcode == -1) {
-            printf("%d: Error: invalid opcode '%s'\n", lineno, parse->opcode);
+        if (parse->op.opcode == -1) {
+            printf("%d: Error: invalid opcode\n", lineno);
             return -1;
         }
 
-        switch (find_op_format(parse->opcode)) {
+        switch (parse->op.format) {
         case FORMAT_1:
             return 1;
         case FORMAT_2:
             return 2;
         case FORMAT_3_4:
-            if (parse->op_prefix == '+') {
+            if (parse->op.prefix == '+') {
                 return 4;
             } else {
                 return 3;
             }
-        default:
-            printf("%d: Error: invalid opcode '%s'\n", lineno, parse->opcode);
+        case FORMAT_NOT_FOUND:
+            printf("%d: Error: invalid opcode\n", lineno);
             return -1;
         }
     }
+    return -1;
 }
 
 static int first_pass(const char* file, FILE* tmp, symtab symbols)
@@ -265,7 +307,7 @@ static int first_pass(const char* file, FILE* tmp, symtab symbols)
 
         if (first_real_line) {
             first_real_line = 0;
-            if (strcmp(parse.opcode, "START") != 0) {
+            if (parse.op.opcode != DIRECTIVE_START) {
                 printf("%d: Error: file does not begin with START directive.\n", lineno);
                 goto error;
             }
@@ -278,10 +320,10 @@ static int first_pass(const char* file, FILE* tmp, symtab symbols)
 
             fprintf(tmp, "%d|%d|%s", loc_ctr, loc_ctr, line);
             continue;
-        } else if (strcmp(parse.opcode, "END") == 0) {
+        } else if (parse.op.opcode == DIRECTIVE_END) {
             fprintf(tmp, "%d|%d|%s", loc_ctr, loc_ctr, line);
             break;
-        } else if (strcmp(parse.opcode, "BASE") == 0) {
+        } else if (parse.op.opcode == DIRECTIVE_BASE) {
             fprintf(tmp, "%d|%d|%s", loc_ctr, loc_ctr, line);
             continue;
         }
@@ -322,19 +364,18 @@ static void write_listing(FILE* lst, int lineno, struct im_parse_result* parse, 
 {
     fprintf(lst, "%4d   ", lineno * 5);
     fprintf(lst, "%04X   ", parse->address);
-    if (parse->p.op_prefix) {
+    if (parse->p.op.prefix) {
         fprintf(lst, "%-9s", parse->p.label);
-        fprintf(lst, "%c", parse->p.op_prefix);
+        fprintf(lst, "%c", parse->p.op.prefix);
     } else {
         fprintf(lst, "%-10s", parse->p.label);
     }
 
     if (parse->p.operand_prefix) {
-        fprintf(lst, "%-9s", parse->p.opcode);
+        fprintf(lst, "%-9s", parse->p.op.name);
         fprintf(lst, "%c", parse->p.operand_prefix);
-    }
-    else {
-        fprintf(lst, "%-10s", parse->p.opcode);
+    } else {
+        fprintf(lst, "%-10s", parse->p.op.name);
     }
 
     fprintf(lst, "%-20s", parse->p.operands);
@@ -620,7 +661,7 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
 
         if (first_real_line) {
             first_real_line = 0;
-            if (strcmp(parse.p.opcode, "START") != 0) {
+            if (parse.p.op.opcode != DIRECTIVE_START) {
                 printf("%d: Error: file does not begin with START directive.\n", lineno);
                 goto error;
             }
@@ -634,7 +675,7 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
             flush_text_record(obj, &rec, starting_address);
             continue;
 
-        } else if (strcmp(parse.p.opcode, "BASE") == 0) {
+        } else if (parse.p.op.opcode == DIRECTIVE_BASE) {
             char sym[100];
             if (sscanf(parse.p.operands, "%99s", sym) != 1) {
                 printf("%d: Error: invalid BASE operand\n", lineno);
@@ -649,10 +690,10 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
 
             base_addr = addr;
 
-            fprintf(lst, "%4d%20s%-10s%-20s\n", lineno * 5, "", parse.p.opcode, parse.p.operands);
+            fprintf(lst, "%4d%20s%-10s%-20s\n", lineno * 5, "", "BASE", parse.p.operands);
 
             continue;
-        } else if (strcmp(parse.p.opcode, "END") == 0) {
+        } else if (parse.p.op.opcode == DIRECTIVE_END) {
             flush_text_record(obj, &rec, 0);
 
             for (int i = 0; i < mod_rec.len; ++i) {
@@ -665,12 +706,12 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
 
             fprintf(obj, "E%06X\n", first_executable_addr);
 
-            fprintf(lst, "%4d%20s%-10s%-20s\n", lineno * 5, "", parse.p.opcode, parse.p.operands);
+            fprintf(lst, "%4d%20s%-10s%-20s\n", lineno * 5, "", "END", parse.p.operands);
 
             break;
         }
 
-        if (strcmp(parse.p.opcode, "BYTE") == 0) {
+        if (parse.p.op.opcode == DIRECTIVE_BYTE) {
             char str[4096];
 
             int len = parse_byte_string(parse.p.operands, str, sizeof(str));
@@ -695,7 +736,7 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
 
             write_listing(lst, lineno, &parse, rec.text + rec.len - len, len);
 
-        } else if (strcmp(parse.p.opcode, "WORD") == 0) {
+        } else if (parse.p.op.opcode == DIRECTIVE_WORD) {
             int word;
             if (parse_int(parse.p.operands, &word)) {
                 printf("%d: Error: cannot parse number\n", lineno);
@@ -717,14 +758,14 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
 
             write_listing(lst, lineno, &parse, rec.text + rec.len - 3, 3);
 
-        } else if (strcmp(parse.p.opcode, "RESW") == 0) {
+        } else if (parse.p.op.opcode == DIRECTIVE_RESW) {
 
             // flush text record
             flush_text_record(obj, &rec, parse.pc);
 
             write_listing(lst, lineno, &parse, NULL, 0);
 
-        } else if (strcmp(parse.p.opcode, "RESB") == 0) {
+        } else if (parse.p.op.opcode == DIRECTIVE_RESB) {
 
             flush_text_record(obj, &rec, parse.pc);
 
@@ -736,15 +777,15 @@ static int second_pass(const char* file, int program_length, FILE* tmp, symtab s
             ctx.base_addr = base_addr;
             ctx.symbols = symbols;
             ctx.pc = parse.pc;
-            ctx.opcode = find_opcode(parse.p.opcode);
+            ctx.opcode = parse.p.op.opcode;
 
-            if (ctx.opcode == -1) {
-                printf("%d: Error: invalid opcode '%s'\n", lineno, parse.p.opcode);
+            if (parse.p.op.opcode == -1) {
+                printf("%d: Error: invalid opcode\n", lineno);
                 goto error;
             }
 
-            ctx.op_prefix = parse.p.op_prefix;
-            ctx.fmt = find_op_format(parse.p.opcode);
+            ctx.op_prefix = parse.p.op.prefix;
+            ctx.fmt = parse.p.op.format;
             ctx.operand_prefix = parse.p.operand_prefix;
             ctx.operands = parse.p.operands;
 
