@@ -33,7 +33,7 @@ static int hash(const char* string)
 {
     unsigned long long hash = 0x9522ff583c788efe;
     for (int i = 0; string[i]; ++i) {
-        hash += string[i];
+        hash ^= (string[i] & 0xffull) << 32;
         hash ^= hash << 13;
         hash ^= hash >> 7;
         hash ^= hash << 17;
